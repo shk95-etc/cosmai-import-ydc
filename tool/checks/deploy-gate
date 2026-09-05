@@ -1,0 +1,78 @@
+#!/bin/sh
+# tool/checks/deploy-gate [<ref>] -- a deploy takes only a tree class A has already called green
+# (#233, #228 D5'). Refuses otherwise; COSMAI_FORCE_DEPLOY=1 turns the refusal into a warning
+# naming the journal instead of stopping the deploy.
+#
+# Two records answer "is this tree green at A", read in that order: the CI check run named
+# class-a on this commit (what every other checkout can see), and -- only when gh cannot answer
+# that -- the local tested-tree cache (#214) this same host's own suite run may have left. Either
+# is enough; neither is required to answer both.
+#
+# `tool/stack-build` calls this unconditionally: every build it makes is an image a deploy can
+# ship, whatever host runs it. `db/migrate.sh` calls it only on the production container (no
+# `--container` given) -- the harness and `tool/checks/ddl-drift` always name a throwaway one,
+# and a throwaway tree has nothing to certify.
+
+case "$0" in */*) deploy_gate_dir=${0%/*} ;; *) deploy_gate_dir=. ;; esac
+. "$deploy_gate_dir/tested-tree"
+
+deploy_gate_ref=${1:-HEAD}
+
+# Same match-by-name-alone rule as tool/issue's pick_primary and tool/status's status_primary
+# (#174) -- kept here rather than shared because none of the three sources the others.
+deploy_gate_primary() {
+    dg_repos=${COSMAI_ISSUE_REPOS:-"slopindustries/cosmai slopindustries/cosmai-import-ydc"}
+    dg_origin=${COSMAI_ISSUE_PRIMARY:-$(git remote get-url origin 2>/dev/null || true)}
+    dg_origin_repo=$(printf '%s' "$dg_origin" | sed -E 's#\.git$##; s#.*/##')
+    for dg_repo in $dg_repos; do
+        if [ "${dg_repo##*/}" = "$dg_origin_repo" ]; then
+            printf '%s' "$dg_repo"
+            return
+        fi
+    done
+    printf '%s' "${dg_repos%% *}"
+}
+
+deploy_gate_refuse() {
+    if [ "${COSMAI_FORCE_DEPLOY:-0}" = 1 ]; then
+        printf 'deploy-gate: %s -- forced by COSMAI_FORCE_DEPLOY=1; write the reason on the ops issue journal\n' \
+            "$1" >&2
+        exit 0
+    fi
+    printf 'deploy-gate: refused -- %s\n' "$1" >&2
+    exit 1
+}
+
+if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+    deploy_gate_refuse "dirty tree"
+fi
+
+deploy_gate_sha=$(git rev-parse "$deploy_gate_ref" 2>/dev/null) \
+    || deploy_gate_refuse "no such ref: $deploy_gate_ref"
+deploy_gate_tree=$(git rev-parse "$deploy_gate_ref^{tree}" 2>/dev/null) \
+    || deploy_gate_refuse "no such ref: $deploy_gate_ref"
+
+deploy_gate_ci=unavailable
+if command -v gh >/dev/null 2>&1; then
+    if deploy_gate_ci=$(gh api "repos/$(deploy_gate_primary)/commits/$deploy_gate_sha/check-runs" \
+        --jq '([.check_runs[] | select(.name == "class-a")]
+               | if length == 0 then "none"
+                 elif .[0].conclusion == null then "pending"
+                 else .[0].conclusion end)' 2>/dev/null); then
+        :
+    else
+        deploy_gate_ci=unavailable
+    fi
+fi
+
+[ "$deploy_gate_ci" = success ] && exit 0
+
+deploy_gate_local_class=$(tested_tree_class "$(tested_tree_stamp "$deploy_gate_tree")")
+[ "$deploy_gate_local_class" = A ] && exit 0
+
+case "$deploy_gate_ci" in
+    none) deploy_gate_refuse "no run" ;;
+    pending) deploy_gate_refuse "run pending" ;;
+    unavailable) deploy_gate_refuse "gh unavailable and no local record" ;;
+    *) deploy_gate_refuse "run red ($deploy_gate_ci)" ;;
+esac

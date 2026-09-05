@@ -1,0 +1,64 @@
+# Why CI owns class A (#232, #228 D3'/D4'): nothing in this suite is bound to this host -- a
+# throwaway postgres:18-alpine, dummy secrets tool/checks/test writes for itself, in-repo fixtures
+# and dumps, kiwipiepy's dictionary as an ordinary PyPI wheel -- and the repository is public, so
+# Actions minutes cost nothing running it. Class A here is what lets a worker's own push stay
+# small: the pre-push hook owes CI the whole-suite question instead of paying for it locally
+# (#232 Work 2), and this job's own check run is the commit status a red run shows up as.
+name: suite
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # 17:00 UTC, once a day. tool/issue audit and tool/status read this run's date and conclusion.
+    - cron: "0 17 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: suite-${{ github.ref }}
+  # main and a wave branch are shared history several channels build on -- a later push there must
+  # not cancel a run still proving an earlier one, or a red run in flight goes unreported.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/wave/') }}
+
+jobs:
+  class-a:
+    name: class-a
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      # Plain checkout: `tool/checks/test` with no `--changed` never calls the classifier or the
+      # #197 origin/main rule (both are pre-push-hook concerns), so this run needs no more history
+      # than the default shallow clone gives it (review 2026-09-05 -- the stale reason this carried
+      # from the hook's own comment).
+      - uses: actions/checkout@v7
+
+      - name: install postgresql-client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      # .python-version pins the interpreter uv resolves here to the same one dev pushes use
+      # (#232 review): ubuntu-latest's system python3 (3.12) otherwise wraps argparse's usage
+      # text differently from the 3.13 the tests/snapshots/cosmai_help.txt snapshot was recorded
+      # under, and that alone failed the class-a run.
+      # No major-only alias tag exists for this action (unlike actions/checkout's `v7`) -- pinned
+      # to the exact release tag instead (`v10` alone does not resolve, confirmed the hard way).
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+
+      - name: tool/checks/test (class A, the whole suite)
+        env:
+          COSMAI_TEST_PG_PORT: "55432"
+          TERM: dumb
+        run: |
+          set -o pipefail
+          tool/checks/test | tee /tmp/suite-output.log
+
+      - name: pytest summary
+        if: always()
+        run: |
+          {
+            echo '### pytest summary'
+            echo '```'
+            grep -E '^[0-9]+ (passed|failed|error|no tests ran)' /tmp/suite-output.log | tail -1
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

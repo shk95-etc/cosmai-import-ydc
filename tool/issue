@@ -47,6 +47,87 @@ pick_primary() {
     printf '%s' "${REPOS%% *}"
 }
 
+# #232 Work 3: `ready` shows the CI status of each open issue branch's tip -- the whole reason CI,
+# not a worker's push, runs class A is worth nothing if a red run is invisible until someone opens
+# the workflow by hand. One `gh api` call per branch, tolerated: `gh` is required at the top of this
+# script, so a failure here is the API call itself, not a missing binary.
+#
+# Prints a JSON object {"<channel>#<issue number>": "<status>"} on stdout, built from every origin
+# branch shaped like a worker's own (`<channel>/<n>-<slug>`) -- a wave branch names no single issue,
+# so it is not looked up here.
+collect_ci_status() {
+    ci_primary=$1
+    ci_tmp=$(mktemp)
+    git for-each-ref refs/remotes/origin --format='%(refname:short) %(objectname)' 2>/dev/null \
+    | while read -r ci_ref ci_sha; do
+        ci_name=${ci_ref#origin/}
+        case "$ci_name" in
+            */[0-9]*-*) ;;
+            *) continue ;;
+        esac
+        ci_tail=${ci_name##*/}
+        ci_number=${ci_tail%%-*}
+        case "$ci_number" in
+            '' | *[!0-9]*) continue ;;
+        esac
+        ci_channel=${ci_name%/*}
+        if ci_conclusion=$(gh api "repos/$ci_primary/commits/$ci_sha/check-runs" \
+            --jq '([.check_runs[] | select(.name == "class-a")]
+                   | if length == 0 then "none"
+                     elif .[0].conclusion == null then "pending"
+                     else .[0].conclusion end)' 2>/dev/null); then
+            :
+        else
+            ci_conclusion=unavailable
+        fi
+        printf '%s\t%s\n' "$ci_channel#$ci_number" "$ci_conclusion"
+    done > "$ci_tmp"
+    jq -R -s 'split("\n") | map(select(length > 0) | split("\t")) | map({(.[0]): .[1]}) | add // {}' \
+        "$ci_tmp"
+    rm -f "$ci_tmp"
+}
+
+# #233 (#228 D4'): whether the same branch owes a green class-A run before it merges -- cheap
+# enough for every open branch because it only diffs two refs already on `origin`, never checking
+# the branch out (tool/ci_owed.py, which reads tests/scope.toml's gate/trigger lists).
+collect_ci_owed() {
+    co_tmp=$(mktemp)
+    git for-each-ref refs/remotes/origin --format='%(refname:short)' 2>/dev/null \
+    | while read -r co_ref; do
+        co_name=${co_ref#origin/}
+        case "$co_name" in
+            */[0-9]*-*) ;;
+            *) continue ;;
+        esac
+        co_tail=${co_name##*/}
+        co_number=${co_tail%%-*}
+        case "$co_number" in
+            '' | *[!0-9]*) continue ;;
+        esac
+        co_channel=${co_name%/*}
+        co_answer=$(python3 "$issue_tool_dir/ci_owed.py" "origin/$co_name" "origin/main" 2>/dev/null) \
+            || co_answer="unavailable"
+        printf '%s\t%s\n' "$co_channel#$co_number" "$co_answer"
+    done > "$co_tmp"
+    jq -R -s 'split("\n") | map(select(length > 0) | split("\t")) | map({(.[0]): .[1]}) | add // {}' \
+        "$co_tmp"
+    rm -f "$co_tmp"
+}
+
+# #232 Work 3: the last scheduled (nightly) run of suite.yml -- what `tool/issue audit` puts first
+# and `tool/status`'s `== ci ==` block repeats. {"available": false} when the call itself failed,
+# distinct from {"available": true, "run": null} when it answered with no scheduled run at all.
+nightly_status() {
+    nightly_primary=$1
+    if nightly_raw=$(gh api \
+        "repos/$nightly_primary/actions/workflows/suite.yml/runs?event=schedule&per_page=1" \
+        2>/dev/null); then
+        printf '%s' "$nightly_raw" | jq '{available: true, run: (.workflow_runs[0] // null)}'
+    else
+        printf '%s' '{"available": false}'
+    fi
+}
+
 STALE_HOURS=24
 MEMO_DAYS=14
 RECHECK_DAYS=14
@@ -339,15 +420,29 @@ def head:
   if .channel == null then "(no channel)"
   elif .epic != null then .channel + " — " + .epic_title + " (" + .epic + ")"
   else .channel + " — (no epic)" end;
+# #232 Work 3: only an issue with a branch on origin has anything to show -- $ci carries a key for
+# every branch found, so a missing key means no branch, not "ci: none" (that is what a branch with
+# no check run yet gets, from collect_ci_status itself).
+def ci_suffix($channel):
+  # A channel carries its "ch:" label prefix here, but a branch is named after the bare channel
+  # (AGENTS.md: `<channel>/<issue#>-<slug>`, e.g. `tool/11-thing`, never `ch:tool/11-thing`).
+  ((if ($channel | startswith("ch:")) then $channel[3:] else $channel end)
+   + "#" + (.key | split("#")[1])) as $ci_key
+  # #233: the A-owed flag rides the same key -- shown only alongside a CI status, since neither
+  # means anything for an issue with no branch on origin.
+  | if ($ci[$ci_key] // null) != null then
+      " · ci: " + $ci[$ci_key] + " · A " + ($owed[$ci_key] // "not owed")
+    else "" end;
 [.held as $h | "in progress " + ($h.in_progress | tostring)
  + (if ($h.resources | length) == 0 then ""
     else " · held: " + ([$h.resources[] | .resource + " " + (.keys | join(", "))] | join(" · ")) end)]
-+ ([.channels[] | ["", head]
++ ([.channels[] | . as $c | ["", head]
     + (if (.items | length) == 0 then ["  (none)"]
        else [.items[] | "  " + .key + " · " + .title + (if .needs_user then " [needs-user]" else "" end)
              + " · " + (if .status == "ready" then "ready" else .status + ": " + .detail end)
              + (if .resource != "" then " · resources: " + .resource else "" end)
-             + (if .note != null then " (" + .note + ")" else "" end)]
+             + (if .note != null then " (" + .note + ")" else "" end)
+             + ci_suffix($c.channel // "")]
        end)] | add // [])
 + (if (.user_queue | length) > 0
    then ["", "User queue"]
@@ -501,6 +596,7 @@ AUDIT='
     | $line],
   when_touched_without_todo: [$all[] | select(.short == $primary and tagged("when-touched"))
     | . as $i | select([$todos[] | select(test("TODO\\(#" + ($i.number | tostring) + "\\)"))] | length == 0) | .key],
+  unreachable_tests: $unreachable,
   merged_worktrees: [$worktrees[] | split("\t") | {path: .[0], branch: .[1]}
     | .branch as $b | select($b != "main" and ($merged | index($b)) != null)],
   # #196: a wave branch merged into main but never deleted (locally or on origin) leaves the next
@@ -514,13 +610,36 @@ AUDIT='
   missing_labels: [$repos[] | {repo: .repo, missing: ('"$SHARED_LABELS"' - .labels)} | select((.missing | length) > 0)],
   foreign_closes: $foreign_closes,
   fork_behind: $fork_behind,
-  ownership: $ownership
+  ownership: $ownership,
+  # #232 Work 3: the nightly is a warning the moment it is red, missing, or older than 36h -- a
+  # green run from two days ago is not evidence today ran clean, it is evidence the schedule died.
+  nightly: (
+    if ($nightly.available | not) then
+      {line: "(unavailable)", warn: false}
+    elif ($nightly.run == null) then
+      {line: "no scheduled run found", warn: true}
+    else
+      ($nightly.run.conclusion // "null") as $concl
+      | (($now - ($nightly.run.created_at | fromdateiso8601)) / 3600) as $age_hours
+      | {line: ($nightly.run.created_at + " " + $concl
+                + (if $age_hours > 36 then " (" + ($age_hours | floor | tostring) + "h old)" else "" end)),
+         warn: ($concl != "success" or $age_hours > 36)}
+    end
+  ),
+  # #233 Work 3: pipeline_health/collector_health rows, read straight through -- $ops carries
+  # "(unavailable)" when docker or the container itself could not answer both queries.
+  ops_available: $ops_available,
+  ops: $ops
 }
 '
 
 RENDER_AUDIT='
 def block($title; $lines): ["", $title] + (if ($lines | length) == 0 then ["  none"] else $lines end);
-block("Queue per channel"; [.channels[] | "  " + .channel + " (" + .epic + ") · " + (.length | tostring) + " open"
+(["", "nightly"] + ["  " + .nightly.line + (if .nightly.warn then " ⚠" else "" end)])
++ (["", "ops"] + (if (.ops_available | not) then ["  (unavailable)"]
+                  elif (.ops | length) == 0 then ["  none"]
+                  else [.ops[] | "  " + .] end))
++ block("Queue per channel"; [.channels[] | "  " + .channel + " (" + .epic + ") · " + (.length | tostring) + " open"
       + (if .needs_user > 0 then " · needs-user " + (.needs_user | tostring) else "" end)
       + " · head " + (.head // "none")])
 + block("Started but idle (no change for 24h+)"; [.stale_in_progress[] | "  " + .key + " · " + .assignee + " · " + (.hours | tostring) + "h"])
@@ -528,6 +647,7 @@ block("Queue per channel"; [.channels[] | "  " + .channel + " (" + .epic + ") ·
 + block("stale-open (a merged branch exists but the issue is open)"; [.stale_open[] | "  " + .key + " ← " + (.branches | join(", "))])
 + block("TODO(#n) marker with no open when-touched issue"; [.todo_without_issue[] | "  " + .])
 + block("open when-touched issue with no marker in the code"; [.when_touched_without_todo[] | "  " + .])
++ block("test file no rule reaches"; [.unreachable_tests[] | "  " + .])
 + block("Worktree left behind after its branch was merged"; [.merged_worktrees[] | "  " + .path + " (" + .branch + ")"])
 + block("Merged wave branch left behind"; [.merged_wave_channels[] | "  wave/" + .])
 + block("Shared label missing from a repo"; [.missing_labels[] | "  " + .repo + ": " + (.missing | join(", "))])
@@ -566,7 +686,11 @@ case "$cmd" in
         if [ "$as_json" = 1 ]; then
             printf '%s\n' "$model"
         else
-            printf '%s' "$model" | jq -r "$RENDER_READY"
+            # #232 Work 3: the ci lookup only matters for the rendered form -- --json is the model
+            # a script reads, and a script that wants CI status calls the API itself.
+            ci_json=$(collect_ci_status "$(pick_primary)")
+            owed_json=$(collect_ci_owed)
+            printf '%s' "$model" | jq -r --argjson ci "$ci_json" --argjson owed "$owed_json" "$RENDER_READY"
         fi
         ;;
     recheck)
@@ -618,8 +742,34 @@ case "$cmd" in
         # main, not the working tree: every worktree shares the ref but has its own edits, so a
         # worktree scan gives a different answer per checkout.
         todos=$(git grep -nE 'TODO\(#[0-9]+\)' main -- :/ 2>/dev/null || true)
+        # #231 Work 6: a test file no map entry, reader entry, closure root or the smoke set could
+        # ever select is a blind spot -- nothing but changing it directly ever runs it again.
+        unreachable=$(python3 "$issue_tool_dir/change_scope.py" --unreachable 2>/dev/null || true)
         to_lines='split("\n") | map(select(length > 0))'
         primary=$(pick_primary)
+        # #232 Work 3: the nightly's own section is first, ahead of everything git-derived below --
+        # a red or missing nightly is the more urgent of the two kinds of drift this command reports.
+        nightly_json=$(nightly_status "$primary")
+        # #233 Work 3: ops signals, read the way tool/status's `== db ==` block reads them --
+        # docker exec psql into cosmai-postgres, never through pick_primary (this is the database,
+        # not a repo). Both queries have to succeed for the section to be "available" at all: a
+        # query that dies partway through (a column renamed under a migration in flight) must read
+        # as unavailable, not as a clean ops report.
+        if command -v docker >/dev/null 2>&1 \
+            && ops_pipeline=$(docker exec cosmai-postgres psql -U platform -d app -Atc \
+                "select stage_key || ': ' || freshness from needs.pipeline_health
+                 where freshness in ('late', 'stalled') order by stage_key" 2>/dev/null) \
+            && ops_collector=$(docker exec cosmai-postgres psql -U platform -d app -Atc \
+                "select collector || ':' || coalesce(dataset, '') || ' failed (run ' || run_id || ')'
+                 from needs.collector_health where status = 'failed'
+                 order by started_at desc limit 20" 2>/dev/null); then
+            ops_available=true
+        else
+            ops_available=false
+            ops_pipeline=""
+            ops_collector=""
+        fi
+        ops_lines=$(printf '%s\n%s\n' "$ops_pipeline" "$ops_collector" | grep -v '^$' || true)
         # #175's own detector, called rather than reimplemented: judging "foreign" is one script's
         # job. `upstream` is the fork-checkout remote name; on an upstream checkout it does not
         # exist, so there is nothing to compare against and the section says so instead of erroring.
@@ -653,12 +803,16 @@ case "$cmd" in
         fi
         printf '%s' "$graph_json" | jq -r --argjson now "$now" --argjson stale_hours "$STALE_HOURS" \
             --argjson memo_days "$MEMO_DAYS" \
+            --argjson nightly "$nightly_json" \
+            --argjson ops_available "$ops_available" \
+            --argjson ops "$(printf '%s' "$ops_lines" | jq -R -s "$to_lines")" \
             --arg primary "${primary##*/}" \
             --argjson merged "$(printf '%s' "$merged" | jq -R -s "$to_lines")" \
             --argjson merged_all "$(printf '%s' "$merged_all" | jq -R -s "$to_lines")" \
             --argjson unmerged_all "$(printf '%s' "$unmerged_all" | jq -R -s "$to_lines")" \
             --argjson worktrees "$(printf '%s' "$worktrees" | jq -R -s "$to_lines")" \
             --argjson todos "$(printf '%s' "$todos" | jq -R -s "$to_lines")" \
+            --argjson unreachable "$(printf '%s' "$unreachable" | jq -R -s "$to_lines")" \
             --argjson foreign_closes "$(printf '%s' "$foreign_closes" | jq -R -s "$to_lines")" \
             --argjson fork_behind "$(printf '%s' "$fork_behind" | jq -R -s "$to_lines")" \
             --argjson ownership "$(printf '%s' "$ownership" | jq -R -s "$to_lines")" \

@@ -265,3 +265,147 @@ def test_a_non_numeric_stale_limit_still_expires_a_leaked_slot(acquire):
     assert done.returncode == 0, done.stderr
     assert "acquired" in done.stdout, done.stdout
     assert sorted(p.name for p in acquire.lock_root.iterdir()) == [PORT]
+
+
+def spawn_live_pid(tmp_path: Path) -> subprocess.Popen:
+    """A process guaranteed to still be running, for a slot's recorded pid to point at."""
+    return subprocess.Popen(["sleep", "30"])
+
+
+def spawn_dead_pid(tmp_path: Path) -> int:
+    """A pid guaranteed to be exited, for a slot's recorded (leaked) pid to point at."""
+    proc = subprocess.Popen(["sh", "-c", "exit 0"])
+    proc.wait(timeout=5)
+    return proc.pid
+
+
+# #240: the second of two overlapping pushes from one worktree adopted the first's still-running
+# slot as a leak and pulled its container out from under it (2026-09-05). A slot's recorded pid is
+# how the second run tells "still running" from "actually leaked" apart.
+def test_a_live_owner_on_the_same_port_is_waited_for(acquire):
+    holder = spawn_live_pid(acquire.lock_root)
+    try:
+        slot = acquire.lock_root / PORT
+        slot.mkdir(parents=True)
+        (slot / "pid").write_text(f"{holder.pid}\n", encoding="utf-8")
+        with pytest.raises(subprocess.TimeoutExpired) as waited:
+            acquire([0, 0, 0, 0], interval="1", timeout=2.5)
+        stdout = (waited.value.stdout or b"").decode()
+        assert "waiting: a suite is already running on this port from this worktree" in stdout, stdout
+        assert "acquired" not in stdout, stdout
+    finally:
+        holder.terminate()
+        holder.wait(timeout=5)
+
+
+def test_a_dead_owner_older_than_the_limit_is_reclaimed(acquire):
+    dead_pid = spawn_dead_pid(acquire.lock_root)
+    slot = acquire.lock_root / PORT
+    slot.mkdir(parents=True)
+    (slot / "pid").write_text(f"{dead_pid}\n", encoding="utf-8")
+    age(slot, 60 * 4)
+    done = acquire([0])
+    assert done.returncode == 0, done.stderr
+    assert waiting_lines(done.stdout) == [], done.stdout
+    assert "acquired" in done.stdout, done.stdout
+    assert (acquire.lock_root / PORT).is_dir()
+
+
+# The container block of tool/checks/test is lifted out rather than restated, so a change there
+# cannot pass here without also being exercised. The range covers the port's holder-refusal, the
+# slot acquisition and the leaked-container removal in whichever order the file currently has them.
+CONTAINER_BLOCK = ["sed", "-n", '/holder=\\$(docker ps --filter/,/docker rm -f -v "\\$name"/p']
+
+
+def test_a_second_run_on_the_same_port_does_not_remove_the_first_s_container(tmp_path: Path):
+    block = subprocess.run(
+        [*CONTAINER_BLOCK, str(REPO_ROOT / "tool" / "checks" / "test")],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "suite_lock_acquire" in block and "docker rm -f -v" in block, (
+        "the container block moved; this test extracts nothing"
+    )
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "docker.calls"
+    name = f"cosmai-test-postgres-{PORT}"
+    docker = bin_dir / "docker"
+    docker.write_text(
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "$*" >> "{calls}"\n'
+        'if [ "$1" = "ps" ]; then\n'
+        f'    printf "%s\\n" "{name}"\n'
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    docker.chmod(0o755)
+
+    lock_root = tmp_path / "locks"
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "COSMAI_SUITE_LOCK_DIR": str(lock_root),
+        "COSMAI_SUITE_WAIT_SECONDS": "1",
+        "COSMAI_SUITE_WAIT_TIMEOUT_SECONDS": "20",
+    }
+
+    def driver(tag: str, hold_seconds: int) -> tuple[Path, Path]:
+        ready = tmp_path / f"ready-{tag}"
+        script = tmp_path / f"driver-{tag}.sh"
+        script.write_text(
+            f"set -e\n"
+            f". {REPO_ROOT / 'tool' / 'checks' / 'suite-lock'}\n"
+            f"port={PORT}\n"
+            f"name={name}\n"
+            f"{block}\n"
+            f': > "{ready}"\n'
+            f"sleep {hold_seconds}\n"
+            f'rm -rf "$suite_lock_dir"\n',
+            encoding="utf-8",
+        )
+        return script, ready
+
+    script1, ready1 = driver("1", hold_seconds=3)
+    proc1 = subprocess.Popen(
+        ["sh", str(script1)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    try:
+        for _ in range(100):
+            if ready1.exists():
+                break
+            time.sleep(0.05)
+        assert ready1.exists(), "the first run never reached the container block"
+
+        script2, ready2 = driver("2", hold_seconds=0)
+        proc2 = subprocess.Popen(
+            ["sh", str(script2)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        try:
+            time.sleep(1.0)
+            assert not ready2.exists(), "the second run proceeded while the first still holds the port"
+            rm_calls = [
+                line for line in calls.read_text(encoding="utf-8").splitlines() if line.startswith("rm ")
+            ]
+            assert len(rm_calls) <= 1, "the second run removed a container before the first released"
+
+            out2, err2 = proc2.communicate(timeout=15)
+            assert proc2.returncode == 0, err2
+            assert "waiting: a suite is already running on this port from this worktree" in out2, out2
+        finally:
+            if proc2.poll() is None:  # pragma: no cover - only on a failure path
+                proc2.kill()
+
+        proc1.wait(timeout=15)
+        assert proc1.returncode == 0
+    finally:
+        if proc1.poll() is None:  # pragma: no cover - only on a failure path
+            proc1.kill()
+
+    final_rm_calls = [
+        line for line in calls.read_text(encoding="utf-8").splitlines() if line.startswith("rm ")
+    ]
+    assert final_rm_calls == [f"rm -f -v {name}", f"rm -f -v {name}"], final_rm_calls

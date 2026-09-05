@@ -6,8 +6,8 @@
 # `tool/checks/test` alone is that whole suite. `tool/checks/test --changed [<base>]` asks what the
 # change can break first (#215) and runs the smallest verification that answers it:
 #
-#   A  the whole suite      the database, the packaging, the gate itself, or anything unmapped
-#   B  the mapped tests + the DB-free suite    code under one package (tests/scope.toml)
+#   A  the whole suite      the trigger list, the gate itself, a joining merge, or anything unmapped
+#   B  the computed set     mapped tests + the readers map + the import closure + smoke (#231)
 #   C  format·lint·lang + the snapshot tests   prose, or code tool/checks/invariants proves is unmoved
 #   N  format·lint, recorded nowhere           a tree identical to the base: there is nothing to verify
 set -e
@@ -26,16 +26,19 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_COMMON_DIR PYTEST_ADDO
 change_class=A
 change_reason="no --changed: the whole suite was asked for"
 change_tests=""
+change_owed=""
 change_base=""
 if [ "$1" = "--changed" ]; then
     require_command python3 git
     change_base=${2:-origin/main}
-    # Three lines: the class, the reason, the test paths. The classifier is the only thing that
-    # decides this, so a checkout where it cannot run has no partial mode -- it has the full suite.
+    # Four lines: the class, the reason, the test paths, and what a class-A verdict owes locally
+    # (#232). The classifier is the only thing that decides this, so a checkout where it cannot run
+    # has no partial mode -- it has the full suite.
     if change_scope=$(python3 tool/change_scope.py "$change_base"); then
         change_class=$(printf '%s\n' "$change_scope" | sed -n 1p)
         change_reason=$(printf '%s\n' "$change_scope" | sed -n 2p)
         change_tests=$(printf '%s\n' "$change_scope" | sed -n 3p)
+        change_owed=$(printf '%s\n' "$change_scope" | sed -n 4p)
     else
         change_reason="the classifier could not answer, so the change is worth the whole suite"
     fi
@@ -43,6 +46,18 @@ if [ "$1" = "--changed" ]; then
         A | B | C | N) ;;
         *) change_reason="the classifier said '$change_class', which is not a class"; change_class=A ;;
     esac
+    # #232 Work 2: CI now runs class A on every push, so a local push (COSMAI_GATE=local, set by
+    # .githooks/pre-push) never has to run it itself -- it owes the computed set instead, the same
+    # set the classifier's fourth line names for a change that has one. COSMAI_FORCE_SUITE=1 stays
+    # the one sanctioned way past that (the offline fallback, #214): a forced run answers the real
+    # question, not the local downgrade of it. A change with no computed set at all (the classifier
+    # could not answer) stays class A locally too -- there is nothing smaller to run instead.
+    if [ "${COSMAI_GATE:-}" = local ] && [ "$change_class" = A ] && [ -n "$change_owed" ] \
+       && [ "${COSMAI_FORCE_SUITE:-0}" != 1 ]; then
+        change_class=B
+        change_reason="class A owed — CI runs it on this push"
+        change_tests=$change_owed
+    fi
 elif [ -n "$1" ]; then
     printf 'usage: tool/checks/test [--changed [<base>]]\n' >&2
     exit 2
@@ -77,7 +92,8 @@ cleanup() {
     cleanup_ran=1
     [ -z "$secret_file" ] || rm -f "$secret_file" || true
     [ -z "$container_name" ] || docker rm -f -v "$container_name" >/dev/null 2>&1 || true
-    [ -z "$suite_lock_dir" ] || rmdir "$suite_lock_dir" 2>/dev/null || true
+    # rm -rf, not rmdir: the slot holds a pid file (tool/checks/suite-lock) so it is never empty.
+    [ -z "$suite_lock_dir" ] || rm -rf "$suite_lock_dir" 2>/dev/null || true
     # The entry names the class it was verified at: a tree green for class C is green for a class-C
     # change, and the next push has to be able to see which question was answered (#215).
     [ -z "$suite_green" ] || tested_tree_record "$change_class" || true
@@ -116,11 +132,14 @@ if [ "$change_class" != C ] && [ "$change_class" != N ] && [ -z "$TEST_POSTGRES_
         printf 'port %s is held by container %s (another worktree, or a leak to remove)\n' "$port" "$holder" >&2
         exit 1
     fi
-    # Our own leaked container from a killed run goes first, so it is not counted as somebody
-    # else's suite, and only then does this run queue for one of the host's three slots.
+    # The slot is taken before the container is touched: two overlapping pushes from this same
+    # worktree once removed each other's containers because the container went first (2026-09-05,
+    # #240) -- a run that does not hold this port's slot never gets to call it a leak.
+    suite_lock_acquire "$port"
+    # Only a run that now holds the slot reaches here, so a container still on this port is a leak
+    # from a killed run of this same worktree, never a live one -- this is what removes it.
     # rm -v: removes the postgres image's anonymous volume too (without it every run leaks a ~1GB volume)
     docker rm -f -v "$name" >/dev/null 2>&1 || true
-    suite_lock_acquire "$port"
     secret_file=$(mktemp)
     container_name=$name
     docker run -d --rm --name "$name" -e POSTGRES_PASSWORD=fleet -e POSTGRES_USER=fleet \
@@ -194,20 +213,22 @@ case "$change_class" in
         fi
         ;;
     B)
-        # An entry can map to no tests at all (a directory nothing imports), and a bare `uv run
-        # pytest` there would collect the whole suite -- the opposite of what this class is for.
+        # #231: the computed set IS the verification now -- the mapped tests, the readers map, the
+        # import closure and the smoke set, unioned by tool/change_scope.py. No whole-tree DB-free
+        # arm any more: that used to be the safety net for whatever the map missed, and the readers
+        # map and the closure are that net now, sized to the change instead of to the whole tree.
+        # An entry can still resolve to no tests at all (a directory nothing imports and nothing
+        # reads), and a bare `uv run pytest` there would collect the whole suite -- the opposite of
+        # what this class is for.
+        #
+        # This stays a focused session, not COSMAI_FULL_SUITE: the #30 registration guard in
+        # tests/conftest.py only fires at the end of a whole-tree run, and none of the five smoke
+        # tests need it -- test_registry_loading.py restores the registry itself, in its own
+        # teardown fixture, the same as any other test that touches it (#231).
         if [ -n "$change_tests" ]; then
             printf '→ pytest %s\n' "$change_tests"
             uv run pytest $change_tests
         fi
-        # The whole suite minus the part that needs the database: a package's own tests say the
-        # package is right, and this says nothing else in the tree noticed. The marker expression
-        # repeats the two the ini file excludes, because -m on the command line replaces it.
-        # COSMAI_FULL_SUITE: this is a whole-tree session, which is the shape the #30 registration
-        # guard exists for -- one file poisoning the next (#215 review I5). The mapped run above is
-        # a focused session and stays without it.
-        printf '→ pytest (the DB-free suite)\n'
-        COSMAI_FULL_SUITE=1 uv run pytest -m 'not postgres and not live and not local_llm'
         ;;
     *)
         printf '→ pytest\n'

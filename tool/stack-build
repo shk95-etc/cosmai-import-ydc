@@ -10,6 +10,10 @@ set -e
 . tool/checks/prerequisite
 require_command docker
 
+# #233 (#228 D5'): every image this makes is one a deploy can ship, whatever host runs it -- the
+# gate runs before docker touches anything, not only when the image is actually shipped.
+tool/checks/deploy-gate
+
 # Same tag as stack/Dockerfile.cron's ARG COSMAI_IMAGE default; tests/stack/test_image_tag.py holds
 # the two together, along with README.md and stack/Dockerfile's own comment.
 echo "→ docker build -f stack/Dockerfile -t cosmai-needs:local ."

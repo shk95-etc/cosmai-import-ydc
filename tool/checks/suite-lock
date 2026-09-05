@@ -31,16 +31,26 @@ suite_lock_whole() {
 
 # A slot older than the longest possible run belongs to nothing: drop it before counting, out loud,
 # because a silently vanishing lock and a silently held one are equally hard to reason about.
+# rm -rf, not rmdir: a slot now carries a "pid" file (below), so a leaked one is never empty.
 suite_lock_expire() {
     suite_lock_age=$(suite_lock_whole "${COSMAI_SUITE_LOCK_STALE_MINUTES:-$SUITE_LOCK_STALE_MINUTES}" \
         "$SUITE_LOCK_STALE_MINUTES")
     find "$(suite_lock_root)" -mindepth 1 -maxdepth 1 -type d -mmin "+$suite_lock_age" 2>/dev/null \
     | while read -r suite_lock_stale; do
-        rmdir "$suite_lock_stale" 2>/dev/null \
+        rm -rf "$suite_lock_stale" 2>/dev/null \
             && printf 'suite-lock: dropped a slot older than %s minutes (%s)\n' \
                 "$suite_lock_age" "$suite_lock_stale" \
             || true
     done
+}
+
+# A slot's owner writes its pid here on success (below); a reader with no file, or a dead pid,
+# holds nothing -- the slot is a leak, not a live run.
+suite_lock_owner_alive() {
+    [ -f "$1/pid" ] || return 1
+    suite_lock_owner_pid=$(cat "$1/pid" 2>/dev/null)
+    [ -n "$suite_lock_owner_pid" ] || return 1
+    kill -0 "$suite_lock_owner_pid" 2>/dev/null
 }
 
 suite_lock_containers() {
@@ -77,12 +87,22 @@ suite_lock_acquire() {
 
     suite_lock_polls=0
     suite_lock_waited=0
+    suite_lock_dir="$(suite_lock_root)/$1"
     suite_lock_expire
     suite_lock_running=$(suite_lock_count)
-    while [ "$suite_lock_running" -ge "$MAX_CONCURRENT_SUITES" ]; do
+    # #240: two pushes from the same worktree overlapped on 2026-09-05 and the second one adopted
+    # the first's still-running slot as a leak, pulling its container out from under it mid-suite.
+    # A live owner on THIS port is waited for like any other full slot; only a dead or absent owner
+    # -- or one the age limit below reclaims -- is actually a leak.
+    while [ "$suite_lock_running" -ge "$MAX_CONCURRENT_SUITES" ] \
+       || suite_lock_owner_alive "$suite_lock_dir"; do
         if [ $((suite_lock_polls % suite_lock_every)) -eq 0 ]; then
-            printf 'waiting: %s suites running (limit %s, slots in %s)\n' \
-                "$suite_lock_running" "$MAX_CONCURRENT_SUITES" "$(suite_lock_root)"
+            if suite_lock_owner_alive "$suite_lock_dir"; then
+                printf 'waiting: a suite is already running on this port from this worktree\n'
+            else
+                printf 'waiting: %s suites running (limit %s, slots in %s)\n' \
+                    "$suite_lock_running" "$MAX_CONCURRENT_SUITES" "$(suite_lock_root)"
+            fi
         fi
         # Waiting for ever is the one failure mode nobody can diagnose from the outside, so the wait
         # gives up and says where to look and how much of the count was a real container.
@@ -99,8 +119,10 @@ suite_lock_acquire() {
     done
 
     mkdir -p "$(suite_lock_root)"
-    suite_lock_dir="$(suite_lock_root)/$1"
-    # An existing directory for THIS port is a leak from a killed run of this same worktree, never
-    # another suite: the port is derived from the worktree path. Adopting it is how it gets cleaned.
+    # A directory for THIS port that survives to here has no live owner: either it never existed,
+    # or the age limit above dropped it, or its owner exited without one (no pid file). A leak,
+    # never another live suite -- the port is derived from the worktree path.
+    rm -rf "$suite_lock_dir" 2>/dev/null || true
     mkdir "$suite_lock_dir" 2>/dev/null || true
+    printf '%s\n' "$$" > "$suite_lock_dir/pid" 2>/dev/null || true
 }

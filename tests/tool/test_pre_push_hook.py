@@ -313,7 +313,9 @@ def ddl(repo: Path, text: str) -> str:
 
 def test_a_class_c_entry_does_not_skip_a_push_that_earns_class_a(repo: Path):
     # #215 review C2: the entry named the class but the hook read only the stamp, so 38 seconds of
-    # format, lint and three snapshot tests skipped the suite for a DDL change.
+    # format, lint and three snapshot tests skipped the suite for a DDL change. The real repo's map
+    # answers `contracts/ddl/` (#232 review: `try_computed_set` owes a computed set here, so what
+    # this earns is B, not A -- either still outranks a class-C entry, which is the point).
     base = commit(repo, "one")
     origin_main(repo, base)
     sha = ddl(repo, "CREATE TABLE a (id int);\n")
@@ -321,8 +323,9 @@ def test_a_class_c_entry_does_not_skip_a_push_that_earns_class_a(repo: Path):
     assert suite_runs(repo) == 1
 
     done = run_hook(repo, sha)
-    assert suite_runs(repo) == 2, "a class-C entry skipped a class-A push"
-    assert "untested for class A" in done.stdout, done.stdout
+    assert suite_runs(repo) == 2, "a class-C entry skipped a push that earned more"
+    assert "untested for class" in done.stdout, done.stdout
+    assert "untested for class C" not in done.stdout, done.stdout
 
 
 def test_a_class_a_entry_skips_a_push_that_earns_class_c(repo: Path):
@@ -358,3 +361,159 @@ def test_an_entry_from_before_the_class_was_recorded_never_skips(repo: Path):
     assert suite_runs(repo) == 1
     run_hook(repo, sha)
     assert suite_runs(repo) == 2, "a class-less entry was read as evidence"
+
+
+# ---------------------------------------------------------------------------------------------
+# #232 Work 2: CI runs class A on every push now, so the hook never runs it locally on its own.
+# These tests carry the REAL tool/checks/test (not the fake) so the downgrade -- which lives
+# there, gated on COSMAI_GATE=local -- is exercised through the actual hook. A PATH that mirrors
+# the real one but hides docker/uv/pg_isready lets the real script run far enough to print its
+# verification line and then stop at `require_command`, before it would ever start a container.
+# ---------------------------------------------------------------------------------------------
+
+REAL_CARRIED = CARRIED + ("tool/checks/suite-lock",)
+
+
+@pytest.fixture
+def gate_repo(tmp_path: Path) -> Path:
+    """Like `repo`, but tool/checks/test is the real script -- the one place #232's downgrade lives."""
+    root = tmp_path / "gate-repo"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(root)], check=True)
+    subprocess.run(["git", "-C", str(root), "config", "user.email", "t@example.com"], check=True)
+    subprocess.run(["git", "-C", str(root), "config", "user.name", "t"], check=True)
+    for carried in REAL_CARRIED:
+        target = root / carried
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPO_ROOT / carried, target)
+    real_test = root / "tool" / "checks" / "test"
+    shutil.copy2(REPO_ROOT / "tool" / "checks" / "test", real_test)
+    real_test.chmod(0o755)
+    (root / "tool" / "checks" / "tested-tree").write_text(
+        TESTED_TREE.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    return root
+
+
+@pytest.fixture(scope="module")
+def no_docker_path(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """A PATH with every real command this run needs, minus docker/uv/pg_isready -- so the real
+    tool/checks/test reaches `require_command` and stops there instead of starting a container.
+    """
+    hide = {"docker", "uv", "pg_isready"}
+    base = tmp_path_factory.mktemp("no-docker-path")
+    shadow_dirs = []
+    for index, directory in enumerate(os.environ.get("PATH", "").split(os.pathsep)):
+        if not directory or not os.path.isdir(directory):
+            continue
+        shadow = base / f"d{index}"
+        shadow.mkdir()
+        try:
+            entries = os.listdir(directory)
+        except OSError:
+            continue
+        for name in entries:
+            if name in hide:
+                continue
+            try:
+                (shadow / name).symlink_to(os.path.join(directory, name))
+            except OSError:
+                continue
+        shadow_dirs.append(str(shadow))
+    return os.pathsep.join(shadow_dirs)
+
+
+def run_gate_hook(
+    repo: Path, no_docker_path: str, *shas: str, extra_env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess:
+    stdin = "".join(f"refs/heads/main {sha} refs/heads/main {ZERO}\n" for sha in shas)
+    env = {
+        "HOME": str(repo),
+        "PATH": no_docker_path,
+        **(extra_env or {}),
+    }
+    return subprocess.run(
+        ["sh", str(HOOK)],
+        cwd=str(repo),
+        input=stdin,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+
+def write_and_commit(repo: Path, path: str, text: str) -> str:
+    target = repo / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "--no-verify", "-m", "feat: x"], check=True)
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def test_a_trigger_change_pushes_the_computed_set_and_prints_it_is_owed(gate_repo: Path, no_docker_path: str):
+    base = write_and_commit(gate_repo, "contracts/ddl/needs/001.sql", "CREATE TABLE a (id int);\n")
+    origin_main(gate_repo, base)
+    sha = write_and_commit(gate_repo, "contracts/ddl/needs/002.sql", "CREATE TABLE b (id int);\n")
+    done = run_gate_hook(gate_repo, no_docker_path, sha)
+    assert "verification: class B" in done.stdout, done.stdout
+    assert "class A owed — CI runs it on this push" in done.stdout, done.stdout
+
+
+def test_cosmai_force_suite_runs_a_real_class_a_locally(gate_repo: Path, no_docker_path: str):
+    base = write_and_commit(gate_repo, "contracts/ddl/needs/001.sql", "CREATE TABLE a (id int);\n")
+    origin_main(gate_repo, base)
+    sha = write_and_commit(gate_repo, "contracts/ddl/needs/002.sql", "CREATE TABLE b (id int);\n")
+    done = run_gate_hook(gate_repo, no_docker_path, sha, extra_env={"COSMAI_FORCE_SUITE": "1"})
+    assert "verification: class A" in done.stdout, done.stdout
+    assert "class A owed" not in done.stdout, done.stdout
+
+
+def test_an_unanswerable_change_still_runs_class_a_locally(gate_repo: Path, no_docker_path: str):
+    base = write_and_commit(gate_repo, "somewhere/file.py", "x = 1\n")
+    origin_main(gate_repo, base)
+    sha = write_and_commit(gate_repo, "somewhere/file.py", "x = 2\n")
+    done = run_gate_hook(gate_repo, no_docker_path, sha)
+    assert "verification: class A" in done.stdout, done.stdout
+    assert "class A owed" not in done.stdout, done.stdout
+    assert "maps to no entry" in done.stdout, done.stdout
+
+
+# ---------------------------------------------------------------------------------------------
+# Review 2026-09-05 (fix round): $earned must reflect what a local push actually RUNS (the
+# downgrade), or a tree recorded as B-with-owed never satisfies its own cache and every re-push
+# of the identical tree re-runs the suite -- the tested-tree cache's whole reason to exist (#214).
+# The `repo` fixture's FAKE_SUITE (not the real tool/checks/test) records whatever class the test
+# tells it to; the real classifier (carried into the fixture) is what computes $earned itself.
+# ---------------------------------------------------------------------------------------------
+
+
+def test_a_tree_recorded_as_b_with_owed_skips_a_later_push_of_the_same_tree(repo: Path):
+    # contracts/ddl/ is a trigger the real map also answers (#232 review): the classifier says A
+    # with a non-empty owed line, so this push's $earned is B, not A -- exactly what
+    # COSMAI_GATE=local would have made the real tool/checks/test run and record.
+    base = commit(repo, "one")
+    origin_main(repo, base)
+    sha = ddl(repo, "CREATE TABLE a (id int);\n")
+    first = run_hook(repo, sha, klass="B")
+    assert "untested for class B" in first.stdout, first.stdout
+    assert suite_runs(repo) == 1, first.stdout
+
+    second = run_hook(repo, sha)
+    assert suite_runs(repo) == 1, "a tree recorded at its own earned class re-ran the suite"
+    assert "skipping the suite" in second.stdout, second.stdout
+    assert "class B" in second.stdout, second.stdout
+
+
+def test_a_forced_push_still_runs_over_a_tree_recorded_as_b_with_owed(repo: Path):
+    base = commit(repo, "one")
+    origin_main(repo, base)
+    sha = ddl(repo, "CREATE TABLE a (id int);\n")
+    run_hook(repo, sha, klass="B")
+    assert suite_runs(repo) == 1
+
+    forced = run_hook(repo, sha, force=True)
+    assert suite_runs(repo) == 2, "COSMAI_FORCE_SUITE=1 did not re-run a B-recorded tree"
+    assert "forced by COSMAI_FORCE_SUITE=1" in forced.stdout, forced.stdout

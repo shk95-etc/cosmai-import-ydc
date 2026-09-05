@@ -333,6 +333,130 @@ def test_a_js_generator_method_is_not_a_block_comment_line(repo: Path):
     assert invariants(repo, base).returncode == 0, "a block-comment line stopped counting as prose"
 
 
+YAML_BEFORE = "# the old wording\nservices:\n  app:\n    image: cosmai:latest\n"
+
+
+def test_a_yaml_comment_only_change_is_invariant(repo: Path):
+    done = rewrite(
+        repo, "stack/docker-compose.yml", YAML_BEFORE, YAML_BEFORE.replace("# the old wording", "# what runs")
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_a_yaml_value_change_is_not_invariant(repo: Path):
+    done = rewrite(repo, "stack/docker-compose.yml", YAML_BEFORE, YAML_BEFORE.replace("latest", "v2"))
+    assert done.returncode == 1, done.stdout
+    assert "docker-compose.yml" in done.stdout, done.stdout
+
+
+TOML_BEFORE = '# the old wording\n[project]\nname = "cosmai"\n'
+
+
+def test_a_toml_comment_only_change_is_invariant(repo: Path):
+    done = rewrite(
+        repo, "app.toml", TOML_BEFORE, TOML_BEFORE.replace("# the old wording", "# what this pins")
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_a_toml_value_change_is_not_invariant(repo: Path):
+    done = rewrite(repo, "app.toml", TOML_BEFORE, TOML_BEFORE.replace('"cosmai"', '"cosmai2"'))
+    assert done.returncode == 1, done.stdout
+
+
+DOCKER_BEFORE = "# the old wording\nFROM python:3.13-slim\n"
+
+
+def test_a_dockerfile_comment_only_change_is_invariant(repo: Path):
+    done = rewrite(
+        repo, "stack/Dockerfile", DOCKER_BEFORE, DOCKER_BEFORE.replace("# the old wording", "# base image")
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_a_dockerfile_instruction_change_is_not_invariant(repo: Path):
+    done = rewrite(repo, "stack/Dockerfile", DOCKER_BEFORE, DOCKER_BEFORE.replace("3.13", "3.12"))
+    assert done.returncode == 1, done.stdout
+
+
+def test_a_dockerfile_cron_comment_only_change_is_invariant(repo: Path):
+    # #231 Work 7c: any basename starting with "Dockerfile" routes to the same rule, not only the
+    # bare name and the *.Dockerfile suffix.
+    done = rewrite(
+        repo, "stack/Dockerfile.cron", DOCKER_BEFORE, DOCKER_BEFORE.replace("# the old wording", "# base")
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_a_suffixed_dockerfile_comment_only_change_is_invariant(repo: Path):
+    done = rewrite(
+        repo, "stack/worker.Dockerfile", DOCKER_BEFORE, DOCKER_BEFORE.replace("# the old wording", "# base")
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_a_dockerfile_syntax_directive_is_not_a_comment(repo: Path):
+    # #231 Work 7e: `# syntax=` is a parser directive Docker itself reads before the first
+    # instruction, so changing it changes what the build does even though it looks like a comment.
+    before = "# syntax=docker/dockerfile:1\nFROM python:3.13-slim\n"
+    done = rewrite(repo, "stack/Dockerfile", before, before.replace("dockerfile:1", "dockerfile:1.7"))
+    assert done.returncode == 1, done.stdout
+
+
+def test_a_dockerfile_escape_directive_is_not_a_comment(repo: Path):
+    before = "# escape=a\nFROM python:3.13-slim\n"
+    done = rewrite(repo, "stack/Dockerfile", before, before.replace("escape=a", "escape=b"))
+    assert done.returncode == 1, done.stdout
+
+
+CRON_BEFORE = "# the old wording\n0 * * * * /app/run.sh\n"
+
+
+def test_a_crontab_comment_only_change_is_invariant(repo: Path):
+    done = rewrite(
+        repo, "stack/crontab.d/analyze", CRON_BEFORE, CRON_BEFORE.replace("# the old wording", "# hourly")
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_a_crontab_schedule_change_is_not_invariant(repo: Path):
+    done = rewrite(
+        repo, "stack/crontab.d/analyze", CRON_BEFORE, CRON_BEFORE.replace("0 * * * *", "0 */2 * * *")
+    )
+    assert done.returncode == 1, done.stdout
+
+
+def test_a_gitignore_comment_only_change_is_invariant(repo: Path):
+    done = rewrite(repo, ".gitignore", "# the old wording\n*.pyc\n", "# build output\n*.pyc\n")
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_a_gitignore_pattern_change_is_not_invariant(repo: Path):
+    done = rewrite(repo, ".gitignore", "# the old wording\n*.pyc\n", "# the old wording\n*.pyo\n")
+    assert done.returncode == 1, done.stdout
+
+
+def test_an_env_example_comment_only_change_is_invariant(repo: Path):
+    done = rewrite(
+        repo, "stack/.env.example", "# the old wording\nPORT=5432\n", "# default port\nPORT=5432\n"
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_an_env_example_value_change_is_not_invariant(repo: Path):
+    done = rewrite(
+        repo, "stack/.env.example", "# the old wording\nPORT=5432\n", "# the old wording\nPORT=5433\n"
+    )
+    assert done.returncode == 1, done.stdout
+
+
+def test_a_hash_not_at_line_start_is_not_a_comment_marker(repo: Path):
+    # A `#` inside a value is part of the value, not a comment: only a line whose first character is
+    # `#` reads as commented-out.
+    done = rewrite(repo, "stack/.env.example", 'TOKEN="abc#def"\n', 'TOKEN="abc#xyz"\n')
+    assert done.returncode == 1, done.stdout
+
+
 def test_whitespace_inside_a_sql_literal_is_the_value(repo: Path):
     # #215 review, minor 8: normalizing the whole file made 'a  b' and 'a b' the same row.
     done = rewrite(

@@ -1,0 +1,17 @@
+#!/bin/sh
+# The translation reviewer's mechanical checks, one command and one exit status (#234).
+#
+# `tool/checks/translation <base>` runs, over `git diff --name-only <base>...HEAD`, the three checks
+# every 2026-09-04 translation wave's first review round re-derived by hand: did any code move
+# (`tool/invariants.py --strings-blanked`), does every `§` heading anchor still resolve (the #206
+# resolver, made permanent), and did a comment get dropped instead of carried across (a per-file
+# Hangul-line ledger, `tool/checks/lang --range` as the added-line verdict). When a file under
+# stack/ changed it also renders `docker compose config` at base and at HEAD and compares them.
+#
+# Stdlib only -- no `uv sync` needed, same as tool/checks/invariants.
+set -e
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$here/prerequisite"
+require_command python3 git
+
+exec python3 "$here/../translation.py" "$@"

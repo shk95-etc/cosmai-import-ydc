@@ -1,24 +1,51 @@
-# Which verification a change needs (#215). `tool/checks/test --changed <base>` reads this file and
-# `tool/change_scope.py` turns it into a class: A runs everything, B runs the mapped tests plus the
-# DB-free suite, C runs the format/lint/lang checks and the tests below.
+# Which verification a change needs (#215, #231). `tool/checks/test --changed <base>` reads this
+# file and `tool/change_scope.py` turns it into a class: A runs everything, B runs the computed set
+# (mapped tests + the readers map + the import closure + the smoke set), C runs the format/lint/lang
+# checks and the tests below.
 #
-# `full` is the list of paths whose change can break anything: the database, the packaging or the
-# gate itself. A change touching one of them is class A no matter how small it looks. `tests/scope.toml`
-# is on that list because a wrong entry here is the one error the classifier cannot catch itself.
-full = [
-    "contracts/ddl/",
-    "db/",
+# `gate` is the classifier's own machinery: a wrong entry here is the one error the classifier
+# cannot catch itself, so a change touching one of these is class A no matter how small it looks --
+# no proof talks it down (#230). Since #232, "class A" is a verdict CI always backstops, not
+# necessarily a run this push pays for itself: a gate change judges its own blast radius locally
+# too (the computed set it owes, when it has one), and the whole-suite run happens on GitHub.
+gate = [
     "tests/conftest.py",
     "tests/scope.toml",
+    "tool/change_scope.py",
+    "tool/invariants.py",
     "tool/checks/test",
     "tool/checks/invariants",
     "tool/checks/suite-lock",
     "tool/checks/tested-tree",
-    "tool/change_scope.py",
-    "tool/invariants.py",
     "pyproject.toml",
     "uv.lock",
-    ".githooks/",
+]
+
+# `trigger` replaces the old `full` list's role (#231, D2'): a change here still costs the whole
+# suite, but only these paths are presumed guilty by default -- everything else, on any branch and
+# on main, runs the computed set below. #230's proof still applies: a comment-only edit to one of
+# these earns class C, a real change still forces A (D1 stands). Some entries here also sit in
+# `gate` above -- `gate` is checked first and answers for those unconditionally; this list is kept
+# as option 10's decision text in full, so the two do not drift apart silently.
+trigger = [
+    "contracts/ddl/",
+    "db/views/",
+    "db/migrate.sh",
+    "db/bootstrap",
+    # A deploy artifact, the same as db/views/ and db/migrate.sh: the role grants a deploy applies,
+    # not a one-off backfill (review 2026-09-05, the issue's open question).
+    "db/grants/",
+    "tests/conftest.py",
+    "tests/scope.toml",
+    "tool/checks/",
+    "pyproject.toml",
+    "uv.lock",
+    # #232 review: `uv sync` resolves this interpreter for the whole suite -- an unpinned or wrong
+    # version is the same "the environment itself changed" risk pyproject.toml and uv.lock sit on
+    # this list for (a class-A run failed on exactly this before the pin existed).
+    ".python-version",
+    "analysis/types.py",
+    "cosmai/cli.py",
 ]
 
 # What a prose or translation change is verified by: the checks in tool/checks/{format,lint,lang}
@@ -30,10 +57,38 @@ docs = [
     "tests/test_agents_md.py",
 ]
 
+# The smoke set (#231 Work 1d): always part of the computed set, whatever package a change lands
+# in -- the five surfaces a change anywhere could quietly break (the CLI's own help text, the
+# version strings, the registry's default wiring, the map's own health, the stack's wiring).
+smoke = [
+    "tests/test_cli_help.py",
+    "tests/test_version_strings.py",
+    "tests/test_registry_loading.py",
+    "tests/test_scope_map.py",
+    "tests/stack/test_stack_wiring.py",
+]
+
+# No-answer paths (#231 item 3): none of these carry a test of their own, and a real edit to any of
+# them is class C with no tests at all, comment-only or not -- nothing at runtime reads a
+# .gitignore, a README, a playbook snippet or a GitHub Actions/Claude config file. (A .gitignore
+# edit was class A before #230's empty map entry moved it to B without saying so anywhere; this is
+# where that decision belongs.) playbook/ also keeps its (redundant) empty [map] entry below, so
+# tests/test_scope_map.py's "every code directory has an entry" check still finds it.
+none = [
+    ".github/",
+    ".claude/",
+    "README",
+    "LICENSE",
+    ".gitignore",
+    ".dockerignore",
+    "playbook/",
+]
+
 # Path prefix -> the tests that cover it. The longest matching prefix wins, so `analysis/polarity/`
-# beats `analysis/`. A changed path that matches nothing here is class A: an unmapped file is not a
-# small change, it is an unmeasured one. A changed `tests/**/test_*.py` needs no entry -- the
-# classifier runs the changed test file itself.
+# beats `analysis/`. A changed path that matches nothing here, and that no reader and no import
+# closure claims either, is class A: an unmapped file is not a small change, it is an unmeasured
+# one. A changed `tests/**/test_*.py` needs no entry -- the classifier runs the changed test file
+# itself.
 [map]
 "analysis/" = [
     "tests/test_baselines.py",
@@ -164,8 +219,8 @@ docs = [
     "tests/test_analyze_all.py",
     "tests/retrieval/test_cli_wiring.py",
 ]
-# Class A already covers db/, so this entry is documentation: the tests that read the schema, the
-# roles and the views if the classifier ever stops reaching for the whole suite here.
+# Class A already covers db/views/, db/migrate.sh and db/bootstrap*.sql (the `trigger` list above);
+# this entry is what the rest of db/ (db/backfill/, db/secrets.py, ...) earns instead.
 "db/" = [
     "tests/test_seed.py",
     "tests/test_seed_common.py",
@@ -185,14 +240,40 @@ docs = [
     "tests/test_eval_impl.py",
     "tests/test_eval_lexicon_url.py",
 ]
-# The hooks are class A; the entry names what proves them.
+# The hooks used to sit on the full-suite list; the map now answers for them on its own (#231).
 ".githooks/" = [
     "tests/tool/test_pre_push_hook.py",
     "tests/tool/test_commit_msg_hook.py",
 ]
-# Reference snippets only: nothing imports playbook/, so a change there has no test of its own and
-# an empty list means "the DB-free suite and nothing more".
+# Reference snippets only: nothing imports playbook/. It is also on the `none` list below (#231
+# item 3), so this entry never actually fires -- kept so the directory still names its own absence
+# of a test, in case that ever changes.
 "playbook/" = []
 "portal/" = ["tests/stack/test_stack_wiring.py"]
 "stack/" = ["tests/stack"]
 "tool/" = ["tests/tool"]
+
+# Glob readers (#231 Work 5): a test that finds one of these directories' files by glob/rglob/
+# iterdir rather than by name is invisible to the readers map, which only scans test source for a
+# literal name or path. Pattern (fnmatch, matched against the repo-relative changed path) -> the
+# tests that read it that way. tests/test_scope_map.py pins that every such test in the tree is
+# listed here.
+[readers]
+"stack/crontab.d/*" = [
+    "tests/test_analyze_all.py",
+    "tests/test_pipeline_stage.py",
+    "tests/collectors/naver/test_naver_schedule.py",
+    "tests/collectors/commerce/test_every_dataset_is_collected_and_scheduled.py",
+    "tests/collectors/youtube/test_every_dataset_is_scheduled.py",
+]
+# tests/test_ruff_extend_include.py rglobs the whole tool/ tree for python-shebang scripts (#202,
+# #220) rather than naming any one of them, so the readers map's basename scan can never find it.
+"tool/*" = ["tests/test_ruff_extend_include.py"]
+# .github/ is on the `none` list above (nothing at runtime reads it), which would otherwise leave a
+# workflow edit at zero tests -- but .github/workflows/suite.yml is #232's own wiring, and this test
+# is its wiring test (#232 Work 4).
+".github/workflows/*" = ["tests/tool/test_ci_workflow.py"]
+# The interpreter the class-a run and every dev push resolve has to be the one the tests/snapshots/
+# cosmai_help.txt snapshot was recorded under (review 2026-09-05: a mismatch here is exactly what
+# broke run 33954240253); no basename scan finds it by prefix, so it is a reader like the two above.
+".python-version" = ["tests/tool/test_ci_workflow.py"]

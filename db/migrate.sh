@@ -5,6 +5,7 @@
 set -eu
 
 container=cosmai-postgres
+container_given=0
 db=app
 superuser=platform
 
@@ -31,12 +32,17 @@ EOF
 while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help) usage; exit 0 ;;
-        --container) container=$2; shift 2 ;;
+        --container) container=$2; container_given=1; shift 2 ;;
         --db) db=$2; shift 2 ;;
         --superuser) superuser=$2; shift 2 ;;
         *) echo "needs: unknown argument: $1" >&2; exit 1 ;;
     esac
 done
+
+# #233 (#228 D5'): no --container means the production default, cosmai-postgres -- the harness
+# and tool/checks/ddl-drift always name a throwaway one, and a throwaway tree has nothing to
+# certify, so only the production path ever asks the gate.
+[ "$container_given" = 1 ] || tool/checks/deploy-gate
 
 # What every message below is about. Step (0) sets it to the schema it is working on, so a missing
 # TREND_RADAR_DB_RUNTIME reports itself as a trend_radar problem rather than as a `needs` one.
